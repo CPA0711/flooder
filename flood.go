@@ -1,4 +1,4 @@
-// GO HAQ 
+// CYBER POEPLE ATTACK TOOL 
 //
 //
 //
